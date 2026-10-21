@@ -123,7 +123,31 @@ def contract_cells(con_row, years):
     return summary, cells
 
 
-def build(team_filter, season, years):
+def select_primary(team_depth, max_depth):
+    """Keep only primary guards, capped at max_depth per side, plus the starting C.
+
+    A player counts at guard only if guard is his best (lowest) depth spot
+    anywhere on the chart. Tackles or centers who are listed as a 4th/5th-string
+    guard are dropped. A player listed at both LG and RG is kept on the side
+    where he ranks higher. Ranks are renumbered after filtering.
+    """
+    best_any = team_depth.group_by("gsis_id").agg(pl.col("pos_rank").min().alias("best_any"))
+    guards = (
+        team_depth.filter(pl.col("pos_abb").is_in(["LG", "RG"]))
+        .join(best_any, on="gsis_id")
+        .filter(pl.col("pos_rank") <= pl.col("best_any"))      # guard is his primary spot
+        .sort(["pos_rank", "pos_abb"])
+        .unique(subset="gsis_id", keep="first", maintain_order=True)  # one side per player
+        .sort(["pos_abb", "pos_rank"])
+        .with_columns(pl.int_range(1, pl.len() + 1).over("pos_abb").cast(pl.Int32).alias("pos_rank"))
+        .filter(pl.col("pos_rank") <= max_depth)
+        .drop("best_any")
+    )
+    center = team_depth.filter((pl.col("pos_abb") == "C") & (pl.col("pos_rank") == 1))
+    return pl.concat([center, guards]).sort(["pos_abb", "pos_rank"])
+
+
+def build(team_filter, season, years, max_depth=2):
     today = date.today()
     depth, latest, rosters, snaps, contracts = load_data(season)
 
@@ -137,9 +161,7 @@ def build(team_filter, season, years):
     teams = [team_filter] if team_filter else sorted(TEAM_NICKNAMES)
     rows = []
     for team in teams:
-        d = depth.filter(
-            (pl.col("team") == team) & pl.col("pos_abb").is_in(POSITIONS)
-        ).sort(["pos_abb", "pos_rank"])
+        d = select_primary(depth.filter(pl.col("team") == team), max_depth)
 
         for r in d.iter_rows(named=True):
             # Center: context only, starter only
@@ -209,13 +231,15 @@ def main():
     p.add_argument("--years", type=int, nargs="+", default=[2026, 2027, 2028],
                    help="Contract chart columns (default 2026 2027 2028)")
     p.add_argument("--out", default="og_pull.xlsx", help="Output .xlsx (or .csv)")
+    p.add_argument("--max-depth", type=int, default=2,
+                   help="Guards kept per side after filtering (default 2)")
     a = p.parse_args()
 
     team = a.team.upper() if a.team else None
     if team and team not in TEAM_NICKNAMES:
         raise SystemExit(f"Unknown team '{a.team}'. Use one of: {', '.join(sorted(TEAM_NICKNAMES))}")
 
-    df, latest = build(team, a.season, a.years)
+    df, latest = build(team, a.season, a.years, a.max_depth)
 
     if a.out.endswith(".csv"):
         df.write_csv(a.out)
